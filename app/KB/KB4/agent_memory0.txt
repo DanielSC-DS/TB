@@ -1,0 +1,76 @@
+:- dynamic agent_ID/1.
+
+agent_ID(0).
+
+:- dynamic agent_NAME/1.
+
+agent_NAME("Mace Windu").
+
+:- dynamic agent_ROLE/1.
+
+agent_ROLE("explorer").
+
+:- dynamic agent_state/1.
+
+agent_state(null).
+
+:- dynamic agent_Pos/2.
+
+agent_Pos([1.4138581752777, -0.24924764037132, 0.022019034251571], [1.4554913832399e-5, -2.6100442482857e-5, 2.0937876701355]).
+
+:- dynamic agent_lastPos/2.
+
+agent_lastPos([1.4138569831848, -0.24924854934216, 0.022018743678927], [3.3953059755731e-5, -4.2745836253744e-5, 2.0937931537628]).
+
+:- dynamic agent_GoalsList/1.
+
+agent_GoalsList([]).
+
+:- dynamic point/2.
+
+point(10, [0.44244438409805, -1.8735653162003, 0.051005352288485]).
+point(2, [1.6331638097763, 0.20065873861313, 0.051025092601776]).
+point(11, [0.80529290437698, -0.74999994039536, 0.050820425152779]).
+point(6, [0.80029183626175, -0.84999984502792, 0.051004715263844]).
+point(3, [0.7241595494130865, -1.8735730935764168, 0.051]).
+point(1, [1.6332132786231435, -0.7336189426264036, 0.051]).
+point(4, [0.8999999767908636, -0.7499999004569078, 0.051]).
+point(5, [0.8999998574059885, -0.8499999727334764, 0.051]).
+
+:- dynamic edge/2.
+
+edge(1, [1, 2]).
+edge(2, [3, 1]).
+edge(3, [4, 5]).
+edge(4, [5, 6]).
+edge(7, [10, 3]).
+edge(8, [11, 4]).
+
+:- dynamic outline/2.
+
+outline(1, [10, 3, 1, 2]).
+outline(2, [11, 4, 5, 6]).
+
+:- dynamic wall/2.
+
+
+:- dynamic object/3.
+
+object(1, [11, 4, 5, 6], cyan).
+
+:- dynamic objectExternal/4.
+
+
+:- dynamic objectToConfirm/2.
+
+
+:- dynamic objectPickedUp/3.
+
+objectPickedUp(2, blue, [0.5923270405125587, -1.6075745774763177, 0]).
+
+:- dynamic tag/3.
+
+
+:- dynamic loadedUp/2.
+
+
