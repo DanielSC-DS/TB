@@ -1,6 +1,6 @@
 {
     "name": "cave7",
-    "outcome": "RESCUE",
+    "outcome": "RESCUE_HARD",
     "collected": true,
     "collected_by": [
         3
@@ -9,8 +9,12 @@
         1.4578,
         4.2745
     ],
-    "obstructed_by": null,
-    "obstruction_case": null,
+    "obstructed_by": [
+        1
+    ],
+    "obstruction_case": [
+        "MOVING"
+    ],
     "cooperation_flag": false,
     "conflicts": [
         [

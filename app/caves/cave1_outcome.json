@@ -1,23 +1,20 @@
 {
-    "name": "cave5",
+    "name": "cave1",
     "outcome": "RESCUE_HARD",
     "collected": true,
     "collected_by": [
-        2,
-        3
+        2
     ],
     "position": [
-        4.2421,
-        3.8637
+        2.8357,
+        4.2775
     ],
     "obstructed_by": [
-        0,
         1
     ],
     "obstruction_case": [
-        "MOVING",
         "MOVING"
     ],
-    "cooperation_flag": true,
+    "cooperation_flag": false,
     "conflicts": []
 }

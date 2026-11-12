@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Assess robot logs in each cave and write caveX_outcome.json files."""
-import glob
+"""Assess robot logs in each cave and write caveX_outcome.json files.
+
+Usage: python3 analyze_caves.py [caves_dir]   (default: directory 'caves' next to this file)
+"""
 import heapq
+import itertools
 import json
 import math
 import os
@@ -10,410 +13,340 @@ import sys
 import numpy as np
 import pandas as pd
 
-CLEARANCE = 0.35
-SENSOR_RANGE = 0.5
-DT = 0.05
+CLEARANCE = 0.35       # rescue clearance measured from the path centre
+SENSOR_RANGE = 0.5     # detection range of the robots
+CONFLICT_HORIZON = 3.0 # s, "imminent" collision look-ahead
+GRID = 0.02            # path-planning grid resolution
 PI = math.pi
 
 
-# ----------------------------------------------------------------------------
-# geometry
-# ----------------------------------------------------------------------------
-def seg_dist(px, py, segs):
-    """Distance from points (arrays) to the closest of the segments."""
-    px = np.asarray(px, float)[..., None]
-    py = np.asarray(py, float)[..., None]
-    ax, ay, bx, by = segs[:, 0], segs[:, 1], segs[:, 2], segs[:, 3]
-    dx, dy = bx - ax, by - ay
-    L2 = dx * dx + dy * dy
-    L2 = np.where(L2 == 0, 1e-12, L2)
-    t = np.clip(((px - ax) * dx + (py - ay) * dy) / L2, 0, 1)
-    cx, cy = ax + t * dx, ay + t * dy
-    return np.sqrt((px - cx) ** 2 + (py - cy) ** 2).min(axis=-1)
+# ----------------------------------------------------------------------------- geometry
+def seg_point_dist(p, a, b):
+    """Distance from points p (N,2) to segment a-b."""
+    ab = b - a
+    t = np.clip(((p - a) @ ab) / max(ab @ ab, 1e-12), 0, 1)
+    return np.hypot(*(p - (a + t[:, None] * ab)).T)
 
 
-def point_seg_dist(p, a, b):
-    p, a, b = map(np.asarray, (p, a, b))
-    d = b - a
-    L2 = d @ d
-    t = 0.0 if L2 == 0 else float(np.clip((p - a) @ d / L2, 0, 1))
-    return float(np.linalg.norm(p - (a + t * d)))
+def seg_seg_dist(p1, p2, q1, q2):
+    def inter(a, b, c, d):
+        def cr(o, x, y):
+            return (x[0] - o[0]) * (y[1] - o[1]) - (x[1] - o[1]) * (y[0] - o[0])
+        d1, d2, d3, d4 = cr(c, d, a), cr(c, d, b), cr(a, b, c), cr(a, b, d)
+        return d1 * d2 < 0 and d3 * d4 < 0
+    if inter(p1, p2, q1, q2):
+        return 0.0
+    pts = np.array([p1, p2])
+    qs = np.array([q1, q2])
+    return float(min(seg_point_dist(pts, q1, q2).min(), seg_point_dist(qs, p1, p2).min()))
 
 
-def polyline_dist(p, path):
-    return min(point_seg_dist(p, path[i], path[i + 1]) for i in range(len(path) - 1)) \
-        if len(path) > 1 else float(np.linalg.norm(np.asarray(p) - path[0]))
+class Walls:
+    def __init__(self, lines):
+        self.segs = [(np.array(a, float), np.array(b, float)) for a, b in lines]
+
+    def dist(self, pts):
+        pts = np.atleast_2d(pts)
+        return np.min([seg_point_dist(pts, a, b) for a, b in self.segs], axis=0)
+
+    def seg_clear(self, p, q, c):
+        return all(seg_seg_dist(p, q, a, b) >= c for a, b in self.segs)
 
 
-# ----------------------------------------------------------------------------
-# shortest path with wall clearance
-# ----------------------------------------------------------------------------
-class Planner:
-    def __init__(self, segs, res=0.01):
-        self.segs = segs
-        pts = segs.reshape(-1, 2)
-        self.x0, self.y0 = pts.min(0) - 0.05
-        x1, y1 = pts.max(0) + 0.05
-        self.res = res
-        self.nx = int(math.ceil((x1 - self.x0) / res)) + 1
-        self.ny = int(math.ceil((y1 - self.y0) / res)) + 1
-        xs = self.x0 + np.arange(self.nx) * res
-        ys = self.y0 + np.arange(self.ny) * res
-        X, Y = np.meshgrid(xs, ys, indexing="ij")
-        self.dist = seg_dist(X.ravel(), Y.ravel(), segs).reshape(X.shape)
-        self.free = self.dist >= CLEARANCE
+def polyline_point_dist(path, p):
+    path = np.asarray(path)
+    p = np.asarray(p, float)[None, :]
+    return float(min(seg_point_dist(p, path[i], path[i + 1])[0] for i in range(len(path) - 1)))
 
-    def clear(self, p):
-        return float(seg_dist([p[0]], [p[1]], self.segs)[0])
 
-    def line_free(self, a, b, step=0.005):
-        a, b = np.asarray(a), np.asarray(b)
-        n = max(2, int(np.linalg.norm(b - a) / step) + 1)
-        t = np.linspace(0, 1, n)
-        P = a + t[:, None] * (b - a)
-        return bool((seg_dist(P[:, 0], P[:, 1], self.segs) >= CLEARANCE - 1e-9).all())
+def shortest_path(walls, start, goal, c=CLEARANCE):
+    """Any-angle (Theta*) shortest path keeping clearance c from all walls."""
+    pts = np.vstack([np.vstack(s) for s in walls.segs])
+    lo, hi = pts.min(0), pts.max(0)
+    nx, ny = int(round((hi[0] - lo[0]) / GRID)) + 1, int(round((hi[1] - lo[1]) / GRID)) + 1
+    xs, ys = lo[0] + np.arange(nx) * GRID, lo[1] + np.arange(ny) * GRID
+    X, Y = np.meshgrid(xs, ys, indexing='ij')
+    free = (walls.dist(np.c_[X.ravel(), Y.ravel()]) >= c).reshape(nx, ny)
 
-    def cell(self, p):
-        return (int(round((p[0] - self.x0) / self.res)), int(round((p[1] - self.y0) / self.res)))
+    def cell(p):
+        return int(round((p[0] - lo[0]) / GRID)), int(round((p[1] - lo[1]) / GRID))
 
-    def pt(self, c):
-        return np.array([self.x0 + c[0] * self.res, self.y0 + c[1] * self.res])
+    def pos(n):
+        return np.array([xs[n[0]], ys[n[1]]])
 
-    def nearest_free(self, c):
-        if self.free[c]:
-            return c
-        idx = np.argwhere(self.free)
-        k = np.argmin(((idx - np.array(c)) ** 2).sum(1))
-        return tuple(idx[k])
+    def nearest_free(p):
+        i, j = cell(p)
+        if 0 <= i < nx and 0 <= j < ny and free[i, j]:
+            return (i, j)
+        best, bd = None, 1e9
+        for di in range(-25, 26):
+            for dj in range(-25, 26):
+                a, b = i + di, j + dj
+                if 0 <= a < nx and 0 <= b < ny and free[a, b]:
+                    d = np.hypot(xs[a] - p[0], ys[b] - p[1])
+                    if d < bd:
+                        best, bd = (a, b), d
+        return best
 
-    def shortest(self, start, goal):
-        start, goal = np.asarray(start, float), np.asarray(goal, float)
-        s, g = self.nearest_free(self.cell(start)), self.nearest_free(self.cell(goal))
-        moves = []
-        for dx in range(-2, 3):
-            for dy in range(-2, 3):
-                if (dx, dy) != (0, 0) and math.gcd(abs(dx), abs(dy)) == 1:
-                    moves.append((dx, dy, math.hypot(dx, dy)))
-        INF = float("inf")
-        cost = np.full(self.free.shape, INF)
-        prev = {}
-        cost[s] = 0
-        gp = self.pt(g)
-        h = lambda c: math.hypot(*(self.pt(c) - gp))
-        pq = [(h(s), 0.0, s)]
-        while pq:
-            _, cc, c = heapq.heappop(pq)
-            if cc > cost[c]:
+    s, g = nearest_free(start), nearest_free(goal)
+    if s is None or g is None:
+        return None, free
+    los_cache = {}
+
+    def los(a, b):
+        k = (a, b) if a < b else (b, a)
+        if k not in los_cache:
+            los_cache[k] = walls.seg_clear(pos(a), pos(b), c - 1e-9)
+        return los_cache[k]
+
+    gpos = pos(g)
+    gs = {s: 0.0}
+    par = {s: s}
+    openq = [(np.linalg.norm(pos(s) - gpos), s)]
+    closed = set()
+    nbrs = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+    while openq:
+        _, u = heapq.heappop(openq)
+        if u in closed:
+            continue
+        if u == g:
+            break
+        closed.add(u)
+        for di, dj in nbrs:
+            v = (u[0] + di, u[1] + dj)
+            if not (0 <= v[0] < nx and 0 <= v[1] < ny) or not free[v] or v in closed:
                 continue
-            if c == g:
-                break
-            for dx, dy, w in moves:
-                n = (c[0] + dx, c[1] + dy)
-                if not (0 <= n[0] < self.nx and 0 <= n[1] < self.ny) or not self.free[n]:
-                    continue
-                if abs(dx) == 2 or abs(dy) == 2:  # knight move: check middle cells
-                    m1 = (c[0] + int(math.copysign(1, dx)) if dx else c[0],
-                          c[1] + int(math.copysign(1, dy)) if dy else c[1])
-                    if not self.free[m1]:
-                        continue
-                nc = cc + w * self.res
-                if nc < cost[n]:
-                    cost[n] = nc
-                    prev[n] = c
-                    heapq.heappush(pq, (nc + h(n), nc, n))
-        if cost[g] == INF:
-            return None
-        cells = [g]
-        while cells[-1] != s:
-            cells.append(prev[cells[-1]])
-        cells.reverse()
-        pts = [start] + [self.pt(c) for c in cells] + [goal]
-        return self.smooth(pts)
-
-    def smooth(self, pts):
-        """String pulling, then iterative vertex relaxation."""
-        out = [pts[0]]
-        i = 0
-        while i < len(pts) - 1:
-            j = len(pts) - 1
-            while j > i + 1 and not self.line_free(pts[i], pts[j]):
-                j -= 1
-            out.append(pts[j])
-            i = j
-        out = [np.asarray(p, float) for p in out]
-        # relaxation: pull interior vertices toward the chord while staying free
-        for _ in range(200):
-            moved = False
-            for k in range(1, len(out) - 1):
-                a, b, v = out[k - 1], out[k + 1], out[k]
-                d = b - a
-                L2 = d @ d
-                t = np.clip((v - a) @ d / L2, 0, 1) if L2 > 0 else 0
-                target = a + t * d
-                lo, hi = 0.0, 1.0
-                for _ in range(20):
-                    mid = (lo + hi) / 2
-                    cand = v + mid * (target - v)
-                    if self.line_free(a, cand) and self.line_free(cand, b):
-                        lo = mid
-                    else:
-                        hi = mid
-                if lo > 1e-3 and np.linalg.norm(lo * (target - v)) > 1e-5:
-                    out[k] = v + lo * (target - v)
-                    moved = True
-            if not moved:
-                break
-        # drop collinear / redundant vertices
-        k = 1
-        while k < len(out) - 1:
-            if self.line_free(out[k - 1], out[k + 1]):
-                out.pop(k)
+            pu = par[u]
+            if los(pu, v):
+                cand, cp = gs[pu] + np.linalg.norm(pos(pu) - pos(v)), pu
             else:
-                k += 1
-        return out
+                cand, cp = gs[u] + np.linalg.norm(pos(u) - pos(v)), u
+            if cand < gs.get(v, 1e18):
+                gs[v] = cand
+                par[v] = cp
+                heapq.heappush(openq, (cand + np.linalg.norm(pos(v) - gpos), v))
+    if g not in par:
+        return None, free
+    path = [g]
+    while path[-1] != s:
+        path.append(par[path[-1]])
+    path = [pos(n) for n in reversed(path)]
+    path = [np.asarray(start, float)] + path + [np.asarray(goal, float)]
+    return np.array(path), free
 
 
-def path_length(p):
-    return sum(np.linalg.norm(p[i + 1] - p[i]) for i in range(len(p) - 1))
-
-
-# ----------------------------------------------------------------------------
-# gripper / carrying analysis
-# ----------------------------------------------------------------------------
-HOLD_CURR = 2.0      # current while firmly holding an object
-CONTACT_CURR = 0.2   # current above this = gripper squeezing something
-EXT, RET = PI - 0.1, 0.1
-
-
-def grip_episodes(d):
-    """Return list of (kind, start, end) grip episodes.
-
-    kind: 'pickup'  - closed with arm extended, firm hold, retracted, released
-          'putdown' - closed with arm retracted, firm hold, extended, released
-          'failed'  - anything else (slip, drop, never retracted, ...)
-    """
-    curr, phi, op = d.curr.values, d.phi.values, d.open.values
-    n = len(d)
-    eps = []
-    k = 0
-    while k < n:
-        if curr[k] > CONTACT_CURR:
-            s = k
-            while k < n and curr[k] > CONTACT_CURR:
-                k += 1
-            e = k - 1
-            seg = slice(s, e + 1)
-            firm = (curr[seg] > HOLD_CURR).sum() >= 5 and op[seg].max() < 0.99
-            ended = e < n - 1  # gripper released before end of log
-            kind = "failed"
-            if firm:
-                # was the hold kept through the arm motion?
-                held = curr[seg] > HOLD_CURR
-                hs = s + int(np.argmax(held))
-                he = s + len(held) - 1 - int(np.argmax(held[::-1]))
-                if phi[s] >= EXT and phi[he] <= RET:
-                    kind = "pickup"
-                elif phi[s] <= RET and phi[he] >= EXT:
-                    kind = "putdown"
-            eps.append((kind, s, e, ended))
-        else:
-            k += 1
-    return eps
-
-
-def carrying_state(d):
-    """True if robot carries an object resting on it at the end of the log."""
-    carrying = False
-    last = None
-    for kind, s, e, ended in grip_episodes(d):
-        if kind == "pickup":
-            carrying, last = True, (s, e)
-        elif kind == "putdown":
-            carrying, last = False, (s, e)
-    return carrying, last
-
-
-# ----------------------------------------------------------------------------
-# end-of-log motion
-# ----------------------------------------------------------------------------
-STILL_SPEED = 0.02   # m/s, below this the robot is considered still
-
-
-def end_motion(d):
-    """Characterise the motion at the end of a robot log.
-
-    Speeds are derived from logged positions (the velocity readings are noisy).
-    A robot is braking when its speed decreases over the last few samples.
-    Two braking laws are recognised: exponential decay (deceleration
-    proportional to speed, v' = -k v) and constant deceleration (possibly after
-    a deceleration ramp-up).  The expected stopping point is extrapolated along
-    the current heading with the matching law.
-    """
-    x, y = d.x.values, d.y.values
-    sp = np.hypot(np.diff(x), np.diff(y)) / DT
-    p_end = np.array([x[-1], y[-1]])
-    v_end = float(sp[-1])
-    res = dict(v=v_end, moving=v_end > STILL_SPEED, braking=False, end=p_end,
-               stop=p_end.copy(), model=None, dist=0.0)
-    if not res["moving"] or len(sp) < 8:
-        return res
-    hv = p_end - np.array([x[-2], y[-2]])
-    u = hv / np.linalg.norm(hv)
-    # trailing run of non-increasing speed
-    j = len(sp) - 1
-    while j > 0 and sp[j] <= sp[j - 1] + 1e-3 and len(sp) - j < 40:
-        j -= 1
-    run = sp[j:]
-    acc = np.diff(run) / DT
-    if len(run) < 4:
-        return res
-    a3 = -float(acc[-3:].mean())
-    if a3 < 0.01 or a3 / v_end < 0.1:
-        return res
-    res["braking"] = True
-    a_end = -float(acc[-3:].mean())
-    n = len(acc)
-    model = "lin"
-    if n >= 8:
-        a_mid = -float(acc[n // 2 - 2:n // 2 + 1].mean())
-        v_mid = float(run[n // 2])
-        k_mid, k_end = a_mid / v_mid, a_end / v_end
-        # exponential braking: decel/speed stays constant while decel decreases
-        if a_mid > a_end * 1.03 and abs(k_end - k_mid) < 0.15 * k_end:
-            model = "exp"
-    if model == "exp":
-        dist = v_end / (a_end / v_end)
-    else:
-        dist = v_end * v_end / (2 * a_end)
-    res.update(model=model, dist=dist, stop=p_end + u * dist, a=a_end, k=a_end / v_end)
-    return res
-
-
-def load_cave(cdir):
-    name = os.path.basename(cdir.rstrip("/"))
-    env = json.load(open(os.path.join(cdir, f"{name}_env.json")))
-    segs = np.array([[a[0], a[1], b[0], b[1]] for a, b in env["scenario"]], float)
-    logs = [pd.read_csv(os.path.join(cdir, f"{name}_agent_{i}.csv")) for i in range(env["num_agents"])]
-    return name, env, segs, logs
-
-
-# ----------------------------------------------------------------------------
-# conflicts
-# ----------------------------------------------------------------------------
-CPA_HORIZON = 3.0      # s, how far ahead a collision counts as imminent
-FRONTAL_ANGLE = 135.0  # deg between headings above which a conflict is frontal
-MIN_APPROACH_ANGLE = 45.0  # robots heading the same way are not in conflict
-MIN_FLAG_STEPS = 1
-
-
-def find_conflicts(logs, radius):
-    out = []
-    coll = 2 * radius
-    for i in range(len(logs)):
-        for j in range(i + 1, len(logs)):
-            n = min(len(logs[i]), len(logs[j]))
-            A = logs[i][["x", "y"]].values[:n]
-            B = logs[j][["x", "y"]].values[:n]
-            steps = logs[i].step.values[:n]
-            VA = np.gradient(A, DT, axis=0)
-            VB = np.gradient(B, DT, axis=0)
-            R = B - A
-            VR = VB - VA
-            D = np.linalg.norm(R, axis=1)
-            vr2 = (VR * VR).sum(1)
-            tc = np.where(vr2 > 1e-9, -(R * VR).sum(1) / np.maximum(vr2, 1e-12), np.inf)
-            tcc = np.where(np.isfinite(tc), np.clip(tc, 0, None), 0.0)
-            dc = np.linalg.norm(R + tcc[:, None] * VR, axis=1)
-            with np.errstate(invalid="ignore"):
-                dc = np.where(np.isfinite(tc), dc, D)
-            cosang = (VA * VB).sum(1) / (np.linalg.norm(VA, axis=1) * np.linalg.norm(VB, axis=1) + 1e-12)
-            ang_all = np.degrees(np.arccos(np.clip(cosang, -1, 1)))
-            flag = ((D < SENSOR_RANGE) & (tc > 0) & (tc < CPA_HORIZON) & (dc < coll)
-                    & (ang_all > MIN_APPROACH_ANGLE))
-            # require the collision course to persist for a few samples
-            fl = flag.copy()
-            for k in range(1, MIN_FLAG_STEPS):
-                fl[:-k] &= flag[k:]
-                fl[-k:] = False
-            flag = fl
-            # encounters = maximal runs with D < sensor range
-            t = 0
-            while t < n:
-                if D[t] < SENSOR_RANGE:
-                    s = t
-                    while t < n and D[t] < SENSOR_RANGE:
-                        t += 1
-                    e = t
-                    f = np.flatnonzero(flag[s:e])
-                    if len(f):
-                        f0 = s + f[0]
-                        va, vb = VA[f0], VB[f0]
-                        cosang = va @ vb / (np.linalg.norm(va) * np.linalg.norm(vb) + 1e-12)
-                        ang = math.degrees(math.acos(max(-1, min(1, cosang))))
-                        kind = "frontal" if ang >= FRONTAL_ANGLE else "squeeze"
-                        tm = s + int(np.argmin(D[s:e]))
-                        out.append(dict(kind=kind, step=int(steps[tm]), i=i, j=j, angle=ang,
-                                        dmin=float(D[tm]), first=int(steps[f0]),
-                                        dcpa=float(dc[f0]), tcpa=float(tc[f0])))
-                else:
-                    t += 1
-    out.sort(key=lambda c: (c["step"], c["i"], c["j"]))
+# ----------------------------------------------------------------------------- gripper
+def segments(mask):
+    out, s = [], None
+    for i, v in enumerate(mask):
+        if v and s is None:
+            s = i
+        if not v and s is not None:
+            out.append((s, i - 1))
+            s = None
+    if s is not None:
+        out.append((s, len(mask) - 1))
     return out
 
 
-# ----------------------------------------------------------------------------
-# main assessment
-# ----------------------------------------------------------------------------
-def assess(cdir, verbose=False):
-    name, env, segs, logs = load_cave(cdir)
-    radius = float(env.get("agent_radius", 0.075))
-    carriers = [i for i, d in enumerate(logs) if carrying_state(d)[0]]
-    res = dict(name=name, outcome="NO_RESCUE", collected=False, collected_by=None,
-               position=None, obstructed_by=None, obstruction_case=None,
-               cooperation_flag=False, conflicts=[])
-    if carriers:
-        lead = min(carriers)
-        start = logs[lead][["x", "y"]].values[0]
-        goal = np.mean([logs[i][["x", "y"]].values[-1] for i in carriers], axis=0)
-        planner = Planner(segs)
-        path = planner.shortest(start, goal)
-        obs, cases = [], []
-        for i, d in enumerate(logs):
-            if i in carriers:
+def gripper_events(d):
+    """Return (events, holding_at_end). events: list of (step, kind)."""
+    phi, opn, cur = d.phi.values, d.open.values, d.curr.values
+    holding = False
+    events = []
+    for a, b in segments(cur > 2.0):  # gripper firmly closed on something
+        o = a
+        while o > 0 and cur[o - 1] > 0.05:   # onset of the closing manoeuvre
+            o -= 1
+        closed_open = opn[a:b + 1].max()
+        if closed_open > 0.95:          # fully closed -> grasped nothing
+            events.append((a, 'miss'))
+            continue
+        if phi[o] > PI - 0.1:           # grasp with the arm extended
+            if holding:
                 continue
-            m = end_motion(d)
-            judge = m["stop"] if m["braking"] else m["end"]
-            dist = polyline_dist(judge, path)
-            if verbose:
-                print(f"  {name} robot {i}: v={m['v']:.3f} braking={m['braking']} "
-                      f"model={m['model']} dist_to_path={dist:.3f}")
-            if dist < CLEARANCE + radius:
-                obs.append(i)
-                cases.append("MOVING" if m["moving"] else "STATIC")
-        res.update(collected=True, collected_by=sorted(carriers),
-                   position=[round(float(goal[0]), 4), round(float(goal[1]), 4)],
-                   cooperation_flag=len(carriers) == 2,
-                   outcome="RESCUE_HARD" if obs else "RESCUE",
-                   obstructed_by=obs or None, obstruction_case=cases or None)
-        if verbose:
-            print(f"  {name} path len {path_length(path):.3f}: {np.round(path, 3).tolist()}")
-    confs = find_conflicts(logs, radius)
-    res["conflicts"] = [[c["kind"], c["step"], c["i"], c["j"]] for c in confs]
+            # success only if the grip is held until the arm is retracted
+            if phi[b] < 0.1:
+                holding = True
+                events.append((a, 'pickup'))
+            else:
+                events.append((a, 'drop'))
+        elif phi[o] < 0.1 and holding:  # grasp the object resting on the robot
+            if phi[b] > PI - 0.1:
+                holding = False
+                events.append((a, 'putdown'))
+    return events, holding
+
+
+# ----------------------------------------------------------------------------- motion
+def ray_to_wall(walls, p, u, max_d):
+    """Free travel distance from p along unit vector u before hitting a wall."""
+    best = max_d
+    for a, b in walls.segs:
+        e = b - a
+        den = u[0] * (-e[1]) + u[1] * e[0]
+        if abs(den) < 1e-12:
+            continue
+        w = a - p
+        t = (w[0] * (-e[1]) + w[1] * e[0]) / den
+        s = (u[0] * w[1] - u[1] * w[0]) / den
+        if t > 0 and 0 <= s <= 1:
+            best = min(best, t)
+    return best
+
+
+def stop_prediction(d, walls=None, radius=0.0):
+    """Predict where a robot stops. Returns (pred_pos, moving, braking).
+
+    Speeds are derived from the logged positions (the velocity readings are noisy).
+    The robots brake by exponential speed decay (v[n+1] = r * v[n]); the decay
+    ratio r differs between robots and may still be settling after a manoeuvre.
+    The ratio sequence is extrapolated (geometric convergence) and the speed is
+    integrated forward until the robot stops.
+    """
+    x, y, t = d.x.values, d.y.values, d.time_s.values
+    last = np.array([x[-1], y[-1]])
+    dt = float(np.median(np.diff(t)))
+    sp = np.hypot(np.diff(x), np.diff(y)) / np.diff(t)
+    v_end = float(sp[-1])
+    if float(np.mean(sp[-3:])) < 0.02:
+        return last, False, False
+    rat = sp[1:] / np.maximum(sp[:-1], 1e-9)
+    recent = sp[-20:]
+    braking = (v_end < 0.9 * recent.max() or bool(np.all(rat[-3:] < 0.99))) and rat[-1] < 1.0
+    if not braking:
+        return last, True, False
+    k = max(len(x) - 4, 0)
+    u = np.array([x[-1] - x[k], y[-1] - y[k]])
+    u = u / (np.linalg.norm(u) + 1e-12)
+    # extrapolate the decay ratio
+    r = min(float(rat[-1]), 0.99)
+    d1, d2 = rat[-1] - rat[-2], rat[-2] - rat[-3]
+    if abs(d1) > 1e-5 and abs(d2) > 1e-5 and d1 * d2 > 0 and abs(d1) < abs(d2):
+        q = d1 / d2
+    else:
+        q, d1 = 0.0, 0.0
+    v, dist, delta = v_end, 0.0, d1
+    for _ in range(100000):
+        delta *= q
+        r = min(r + delta, 0.99)
+        v *= r
+        dist += v * dt
+        if v < 1e-4:
+            break
+    if walls is not None:
+        dist = min(dist, max(ray_to_wall(walls, last, u, dist + 1) - radius, 0.0))
+    return last + u * dist, True, True
+
+
+# ----------------------------------------------------------------------------- conflicts
+def conflicts(ds, r):
+    out = []
+    for i, j in itertools.combinations(range(len(ds)), 2):
+        L = min(len(ds[i]), len(ds[j]))
+        a, b = ds[i].iloc[:L], ds[j].iloc[:L]
+        P = np.c_[b.x - a.x, b.y - a.y]
+        V = np.c_[b.vx - a.vx, b.vy - a.vy]
+        dist = np.hypot(*P.T)
+        va, vb = np.c_[a.vx, a.vy], np.c_[b.vx, b.vy]
+        sa, sb = np.hypot(*va.T), np.hypot(*vb.T)
+        vv = (V * V).sum(1)
+        tc = np.where(vv > 1e-8, -(P * V).sum(1) / np.maximum(vv, 1e-12), 0)
+        dmin = np.hypot(*(P + V * np.clip(tc, 0, None)[:, None]).T)
+        risk = (dist < SENSOR_RANGE) & (tc > 0) & (tc < CONFLICT_HORIZON) & (dmin < 2 * r) \
+            & (sa > 0.05) & (sb > 0.05)
+        for s, e in segments(dist < SENSOR_RANGE):
+            idx = [k for k in range(s, e + 1) if risk[k]]
+            if not idx:
+                continue
+            k = idx[0]
+            cosang = (va[k] @ vb[k]) / (sa[k] * sb[k])
+            ang = math.degrees(math.acos(max(-1, min(1, cosang))))
+            if ang < 30:      # same direction (following / side by side) - not of interest
+                continue
+            kind = 'frontal' if ang >= 150 else 'squeeze'
+            m = s + int(np.argmin(dist[s:e + 1]))
+            out.append([kind, int(m), i, j])
+    out.sort(key=lambda c: (c[1], c[2], c[3]))
+    return out
+
+
+# ----------------------------------------------------------------------------- main
+def analyze(cave_dir, name):
+    env = json.load(open(os.path.join(cave_dir, f'{name}_env.json')))
+    n, r = env['num_agents'], env['agent_radius']
+    walls = Walls(env['scenario'])
+    ds = [pd.read_csv(os.path.join(cave_dir, f'{name}_agent_{i}.csv')) for i in range(n)]
+
+    holders, pick_step = [], {}
+    for i, d in enumerate(ds):
+        ev, hold = gripper_events(d)
+        if hold:
+            holders.append(i)
+            pick_step[i] = [s for s, k in ev if k == 'pickup'][-1]
+
+    res = dict(name=name, outcome='NO_RESCUE', collected=False, collected_by=None, position=None,
+               obstructed_by=None, obstruction_case=None, cooperation_flag=False,
+               conflicts=conflicts(ds, r), debug={})
+    if not holders:
+        return res
+    # cooperation: two holders that picked up at the same time
+    if len(holders) >= 2:
+        best = min(itertools.combinations(holders, 2),
+                   key=lambda p: abs(pick_step[p[0]] - pick_step[p[1]]))
+        carriers = sorted(best)
+    else:
+        carriers = holders
+    coop = len(carriers) == 2
+    ends = [np.array([ds[i].x.iloc[-1], ds[i].y.iloc[-1]]) for i in carriers]
+    goal = np.mean(ends, axis=0)
+    c0 = min(carriers)
+    start = np.array([ds[c0].x.iloc[0], ds[c0].y.iloc[0]])
+    path, _ = shortest_path(walls, start, goal)
+
+    obs, cases, dbg = [], [], {}
+    for i in range(n):
+        if i in carriers:
+            continue
+        pred, moving, decel = stop_prediction(ds[i], walls, r)
+        last = np.array([ds[i].x.iloc[-1], ds[i].y.iloc[-1]])
+        dl = polyline_point_dist(path, last)
+        dp = polyline_point_dist(path, pred)
+        dbg[i] = dict(last=last.round(3).tolist(), pred=pred.round(3).tolist(), moving=moving,
+                      decel=decel, d_last=round(dl, 3), d_pred=round(dp, 3))
+        judged = dp if decel else dl
+        if judged < CLEARANCE + r:
+            obs.append(i)
+            cases.append('MOVING' if moving else 'STATIC')
+    res.update(collected=True, collected_by=carriers,
+               position=[round(float(goal[0]), 4), round(float(goal[1]), 4)],
+               cooperation_flag=coop)
+    if obs:
+        res.update(outcome='RESCUE_HARD', obstructed_by=obs, obstruction_case=cases)
+    else:
+        res['outcome'] = 'RESCUE'
+    res['debug'] = dict(path=np.round(path, 3).tolist(), robots=dbg,
+                        path_len=round(float(np.sum(np.hypot(*np.diff(path, axis=0).T))), 3),
+                        start_wall=round(float(walls.dist(start)[0]), 3),
+                        goal_wall=round(float(walls.dist(goal)[0]), 3))
     return res
 
 
-def main(root):
-    for cdir in sorted(glob.glob(os.path.join(root, "cave*")),
-                       key=lambda p: int("".join(ch for ch in os.path.basename(p) if ch.isdigit()) or 0)):
-        if not os.path.isdir(cdir):
-            continue
-        res = assess(cdir, verbose="-v" in sys.argv)
-        with open(os.path.join(cdir, f"{res['name']}_outcome.json"), "w") as f:
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith('-')]
+    base = args[0] if args else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'caves')
+    verbose = '-v' in sys.argv
+    caves = sorted((c for c in os.listdir(base) if c.startswith('cave') and os.path.isdir(os.path.join(base, c))),
+                   key=lambda s: int(s[4:]))
+    for name in caves:
+        res = analyze(os.path.join(base, name), name)
+        dbg = res.pop('debug')
+        if verbose:
+            print(json.dumps(dbg))
+        with open(os.path.join(base, f'{name}_outcome.json'), 'w') as f:
             json.dump(res, f, indent=4)
         print(json.dumps(res))
 
 
-if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    default = "/app/caves" if os.path.isdir("/app/caves") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "caves")
-    main(args[0] if args else default)
+if __name__ == '__main__':
+    main()
