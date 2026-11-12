@@ -1,0 +1,17 @@
+{
+    "name": "cave5",
+    "outcome": "RESCUE",
+    "collected": true,
+    "collected_by": [
+        2,
+        3
+    ],
+    "position": [
+        4.2421,
+        3.8637
+    ],
+    "obstructed_by": null,
+    "obstruction_case": null,
+    "cooperation_flag": true,
+    "conflicts": []
+}
