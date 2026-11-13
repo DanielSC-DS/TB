@@ -1,0 +1,39 @@
+{
+    "name": "cave7",
+    "outcome": "RESCUE_HARD",
+    "collected": true,
+    "collected_by": [
+        3
+    ],
+    "position": [
+        1.4578,
+        4.2745
+    ],
+    "obstructed_by": [
+        1
+    ],
+    "obstruction_case": [
+        "MOVING"
+    ],
+    "cooperation_flag": false,
+    "conflicts": [
+        [
+            "squeeze",
+            283,
+            0,
+            1
+        ],
+        [
+            "frontal",
+            451,
+            0,
+            2
+        ],
+        [
+            "squeeze",
+            533,
+            1,
+            3
+        ]
+    ]
+}
