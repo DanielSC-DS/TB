@@ -1,0 +1,26 @@
+{
+    "name": "cave9",
+    "outcome": "NO_RESCUE",
+    "collected": false,
+    "collected_by": null,
+    "position": null,
+    "obstructed_by": null,
+    "obstruction_case": null,
+    "cooperation_flag": false,
+    "conflicts": [
+        [
+            "squeeze",
+            511,
+            2,
+            3
+        ]
+    ],
+    "found_in": [
+        1,
+        0.6704,
+        3.8148
+    ],
+    "handled_object": [
+        1
+    ]
+}
