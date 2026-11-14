@@ -16,5 +16,14 @@
         "MOVING"
     ],
     "cooperation_flag": false,
-    "conflicts": []
+    "conflicts": [],
+    "found_in": [
+        3,
+        4.3156,
+        2.5453
+    ],
+    "handled_object": [
+        0,
+        3
+    ]
 }

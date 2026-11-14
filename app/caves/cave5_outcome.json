@@ -11,11 +11,19 @@
         3.8637
     ],
     "obstructed_by": [
-        0
+        0,
+        1
     ],
     "obstruction_case": [
+        "MOVING",
         "MOVING"
     ],
     "cooperation_flag": true,
-    "conflicts": []
+    "conflicts": [],
+    "found_in": [
+        0,
+        1.6438,
+        1.8755
+    ],
+    "handled_object": []
 }
